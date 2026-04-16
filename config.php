@@ -3,8 +3,19 @@
 declare(strict_types=1);
 
 return [
-    // The upstream zone that hosts the real game.
+    // The upstream zone that hosts the real game (Host / SNI / переписывание ссылок).
     'upstream_base_domain' => 'won.onl',
+
+    // Прямой IP origin-сервера (обход Cloudflare/DNS). Соединение идёт на этот адрес,
+    // при этом curl использует имя upstreamHost в URL и SNI — как будто запрос к *.won.onl.
+    // Оставьте null, чтобы ходить на upstream по обычному DNS (через CF).
+    'upstream_direct_ip' => '5.45.116.77',
+
+    // Порт upstream (443 для HTTPS, 80 для HTTP если включён upstream_use_http).
+    'upstream_direct_port' => 443,
+
+    // Ходить на origin по HTTP (без TLS), resolve всё равно на upstream_direct_ip.
+    'upstream_use_http' => false,
 
     // The public RU domain that points to this proxy.
     // Example: mirror.ru
@@ -32,4 +43,10 @@ return [
     // Pass the incoming Host header to upstream instead of upstream host.
     // Usually should remain false.
     'preserve_original_host_header' => false,
+
+    // Show detailed proxy errors (curl code, URL, hints). Disable in production after debugging.
+    'show_debug_errors' => true,
+
+    // On fatal PHP errors, try to output a visible HTML page (needs show_debug_errors or always on for fatals).
+    'show_fatal_errors' => true,
 ];

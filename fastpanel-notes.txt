@@ -48,9 +48,15 @@ FastPanel на стороне won.onl (origin) — что проверить
 
 2) Если verify «ok», а в браузере всё равно заглушка FastPanel — это уже ответ origin:
    прокси ходит на IP из upstream_direct_ip, Host/SNI = *.won.onl. На сервере игры
-   должен быть сайт/vhost для этого имени (например ru.won.onl). По умолчанию прокси
-   шлёт минимум заголовков (без X-Forwarded-Host), чтобы панель не путала vhost;
-   при необходимости включите upstream_extra_forward_headers в config.php.
+   должен быть сайт/vhost для этого имени (например ru.won.onl).
+
+   Схема https и канонический хост на origin: см. TZ.md. Прокси шлёт X-Forwarded-Proto,
+   X-Forwarded-Port и при необходимости Forwarded (RFC 7239) с host = имя на origin.
+   Приложение на origin должно доверять IP прокси (РФ-хостинг) в настройках trusted
+   proxies — иначе фреймворк видит «голый» HTTP к :80/:443 и строит http://-URL.
+
+   Если панель путает vhost из‑за Forwarded — отключите upstream_forwarded_rfc7239;
+   если нужен X-Forwarded-Host — upstream_extra_forward_headers.
 
 Полезные ссылки FASTPANEL (если origin на FastVPS)
 --------------------------------------------------

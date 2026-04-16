@@ -31,7 +31,9 @@ if (!empty($config['show_fatal_errors'])) {
     });
 }
 
-main($config);
+if (!defined('PROXY_SKIP_MAIN') || PROXY_SKIP_MAIN !== true) {
+    main($config);
+}
 
 function main(array $config): void
 {
@@ -54,9 +56,8 @@ function main(array $config): void
         ]);
     }
 
-    $upstreamUrl = buildUpstreamUrl($upstreamHost, $config);
     $clientIp = getClientIp();
-    $response = proxyRequest($upstreamUrl, $incomingHost, $upstreamHost, $clientIp, $config);
+    $response = proxyRequest($incomingHost, $upstreamHost, $clientIp, $config);
 
     emitResponse($response, $incomingHost, $upstreamHost, $config);
 }
@@ -192,6 +193,21 @@ function buildUpstreamUrl(string $upstreamHost, array $config): string
     return $scheme . '://' . $upstreamHost . $uri;
 }
 
+/**
+ * Как buildUpstreamUrl, но с явным path (для verify / диагностики).
+ */
+function buildUpstreamUrlWithPath(string $upstreamHost, array $config, string $path): string
+{
+    $path = $path === '' ? '/' : $path;
+    if ($path[0] !== '/') {
+        $path = '/' . $path;
+    }
+
+    $scheme = !empty($config['upstream_use_http']) ? 'http' : 'https';
+
+    return $scheme . '://' . $upstreamHost . $path;
+}
+
 function getClientIp(): string
 {
     $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '';
@@ -221,12 +237,69 @@ function buildCurlResolve(string $upstreamHost, array $config): ?string
         $port = $defaultPort;
     }
 
+    // Частая ошибка: upstream_use_http оставили порт 443 — тогда RESOLVE не совпадает с http:// URL.
+    if ($useHttp && $port === 443) {
+        $port = (int) ($config['retry_http_port'] ?? 80);
+    }
+
     return $upstreamHost . ':' . $port . ':' . $ip;
+}
+
+/**
+ * Порты HTTPS в порядке приоритета (ТЗ: сначала SSL к upstream_direct_ip, затем запасные).
+ */
+function upstreamHttpsPortPriority(array $config): array
+{
+    $direct = (int) ($config['upstream_direct_port'] ?? 443);
+    if ($direct < 1 || $direct > 65535) {
+        $direct = 443;
+    }
+
+    $list = $config['upstream_https_port_priority'] ?? [443];
+    if (!is_array($list) || $list === []) {
+        $list = [443];
+    }
+
+    $seen = [];
+    $ports = [];
+
+    $add = static function (int $p) use (&$ports, &$seen): void {
+        if ($p < 1 || $p > 65535 || isset($seen[$p])) {
+            return;
+        }
+        $seen[$p] = true;
+        $ports[] = $p;
+    };
+
+    $add($direct);
+    foreach ($list as $p) {
+        $add((int) $p);
+    }
+
+    return $ports;
 }
 
 function isCurlSslError(int $errno): bool
 {
     return in_array($errno, [35, 51, 58, 60, 77], true);
+}
+
+/**
+ * Статическая заглушка FASTPANEL на :443 при том, что реальный сайт на :80 (типичный default_server).
+ */
+function isFastPanelStaticPlaceholder(string $body): bool
+{
+    if ($body === '') {
+        return false;
+    }
+
+    $low = strtolower($body);
+
+    if (str_contains($low, '<title>fastpanel</title>')) {
+        return true;
+    }
+
+    return str_contains($low, 'why am i seeing this page') && str_contains($low, 'fastpanel');
 }
 
 /**
@@ -300,7 +373,7 @@ function executeUpstreamCurl(
     ];
 }
 
-function proxyRequest(string $url, string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
+function proxyRequest(string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
 {
     $rawBody = file_get_contents('php://input');
     $requestBody = $rawBody !== false ? (string) $rawBody : '';
@@ -312,17 +385,97 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
         ]);
     }
 
-    $resolveLine = buildCurlResolve($upstreamHost, $config);
-    $result = executeUpstreamCurl($url, $incomingHost, $upstreamHost, $clientIp, $config, $resolveLine, $requestBody);
+    if (!empty($config['upstream_use_http'])) {
+        return proxyRequestSingle(
+            buildUpstreamUrl($upstreamHost, $config),
+            $incomingHost,
+            $upstreamHost,
+            $clientIp,
+            $config,
+            $requestBody,
+            null
+        );
+    }
+
+    $ports = upstreamHttpsPortPriority($config);
+    $lastResult = null;
+    $lastUrl = '';
+    $lastResolve = null;
+    $anyHttpsSslError = false;
+
+    foreach ($ports as $port) {
+        $cfgH = array_merge($config, [
+            'upstream_use_http' => false,
+            'upstream_direct_port' => $port,
+        ]);
+        $urlH = buildUpstreamUrl($upstreamHost, $cfgH);
+        $resolveH = buildCurlResolve($upstreamHost, $cfgH);
+        $result = executeUpstreamCurl($urlH, $incomingHost, $upstreamHost, $clientIp, $cfgH, $resolveH, $requestBody);
+        $lastResult = $result;
+        $lastUrl = $urlH;
+        $lastResolve = $resolveH;
+
+        if ($result['body'] === false && isCurlSslError($result['curl_errno'])) {
+            $anyHttpsSslError = true;
+        }
+
+        $failed = $result['body'] === false || $result['status'] === 0;
+        if (!$failed) {
+            $bodyStr = is_string($result['body']) ? $result['body'] : '';
+            if (
+                ($config['retry_upstream_http_on_fastpanel_placeholder'] ?? true)
+                && isFastPanelStaticPlaceholder($bodyStr)
+            ) {
+                $cfgHttp = array_merge($config, [
+                    'upstream_use_http' => true,
+                    'upstream_direct_port' => (int) ($config['retry_http_port'] ?? 80),
+                ]);
+                $urlHttp = buildUpstreamUrl($upstreamHost, $cfgHttp);
+                $resolveHttp = buildCurlResolve($upstreamHost, $cfgHttp);
+                $resultHttp = executeUpstreamCurl($urlHttp, $incomingHost, $upstreamHost, $clientIp, $cfgHttp, $resolveHttp, $requestBody);
+
+                $httpBody = is_string($resultHttp['body'] ?? null) ? (string) $resultHttp['body'] : '';
+                if (
+                    $resultHttp['body'] !== false
+                    && $resultHttp['status'] !== 0
+                    && $httpBody !== ''
+                    && !isFastPanelStaticPlaceholder($httpBody)
+                ) {
+                    return [
+                        'status' => $resultHttp['status'],
+                        'headers' => $resultHttp['response_headers'],
+                        'body' => $resultHttp['body'],
+                        'content_type' => $resultHttp['content_type'],
+                    ];
+                }
+            }
+
+            return [
+                'status' => $result['status'],
+                'headers' => $result['response_headers'],
+                'body' => $result['body'],
+                'content_type' => $result['content_type'],
+            ];
+        }
+    }
+
+    $result = $lastResult;
+    $url = $lastUrl;
+    $resolveLine = $lastResolve;
+
+    if ($result === null) {
+        respondWithError($config, 502, 'Нет ответа от upstream', [
+            'hint' => 'Проверьте upstream_https_port_priority и upstream_direct_ip.',
+        ]);
+    }
 
     $failed = $result['body'] === false || $result['status'] === 0;
 
     if (
         $failed
-        && empty($config['upstream_use_http'])
         && !empty($config['retry_upstream_http_on_ssl_failure'])
         && $result['body'] === false
-        && isCurlSslError($result['curl_errno'])
+        && $anyHttpsSslError
     ) {
         $cfgHttp = array_merge($config, [
             'upstream_use_http' => true,
@@ -343,6 +496,7 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
 
         respondWithError($config, 502, 'Нет ответа от upstream (HTTPS и HTTP fallback)', [
             'https_upstream_url' => $url,
+            'https_ports_tried' => implode(', ', array_map('strval', $ports)),
             'https_curl_resolve' => $resolveLine ?? '(DNS как обычно)',
             'https_curl_errno' => $result['curl_errno'],
             'https_curl_error' => $result['curl_error'],
@@ -359,6 +513,7 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
         $httpCode = $result['curl_errno'] === 28 ? 504 : 502;
         respondWithError($config, $httpCode, 'Нет ответа от upstream (ошибка cURL)', [
             'upstream_url' => $url,
+            'https_ports_tried' => implode(', ', array_map('strval', $ports)),
             'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
             'curl_errno' => $result['curl_errno'],
             'curl_error' => $result['curl_error'],
@@ -369,6 +524,55 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
     if ($result['status'] === 0) {
         respondWithError($config, 502, 'Upstream вернул HTTP 0 (соединение оборвано или TLS сбой)', [
             'upstream_url' => $url,
+            'https_ports_tried' => implode(', ', array_map('strval', $ports)),
+            'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
+            'curl_errno' => $result['curl_errno'],
+            'curl_error' => $result['curl_error'] ?: '(пусто)',
+            'hint' => curlErrorHint($result['curl_errno'], $config, $result['curl_error']),
+        ]);
+    }
+
+    respondWithError($config, 500, 'Внутренняя ошибка прокси после перебора HTTPS-портов', [
+        'upstream_url' => $url,
+        'https_ports_tried' => implode(', ', array_map('strval', $ports)),
+    ]);
+}
+
+/**
+ * Один запрос к upstream (используется для режима upstream_use_http).
+ *
+ * @param array<int, int>|null $portsTried для сообщений об ошибке
+ */
+function proxyRequestSingle(
+    string $url,
+    string $incomingHost,
+    string $upstreamHost,
+    string $clientIp,
+    array $config,
+    string $requestBody,
+    ?array $portsTried
+): array {
+    $resolveLine = buildCurlResolve($upstreamHost, $config);
+    $result = executeUpstreamCurl($url, $incomingHost, $upstreamHost, $clientIp, $config, $resolveLine, $requestBody);
+
+    $portsStr = $portsTried !== null ? implode(', ', array_map('strval', $portsTried)) : '';
+
+    if ($result['body'] === false) {
+        $httpCode = $result['curl_errno'] === 28 ? 504 : 502;
+        respondWithError($config, $httpCode, 'Нет ответа от upstream (ошибка cURL)', [
+            'upstream_url' => $url,
+            'https_ports_tried' => $portsStr !== '' ? $portsStr : '(HTTP-режим)',
+            'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
+            'curl_errno' => $result['curl_errno'],
+            'curl_error' => $result['curl_error'],
+            'hint' => curlErrorHint($result['curl_errno'], $config, $result['curl_error']),
+        ]);
+    }
+
+    if ($result['status'] === 0) {
+        respondWithError($config, 502, 'Upstream вернул HTTP 0 (соединение оборвано или TLS сбой)', [
+            'upstream_url' => $url,
+            'https_ports_tried' => $portsStr !== '' ? $portsStr : '(HTTP-режим)',
             'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
             'curl_errno' => $result['curl_errno'],
             'curl_error' => $result['curl_error'] ?: '(пусто)',
@@ -382,6 +586,54 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
         'body' => $result['body'],
         'content_type' => $result['content_type'],
     ];
+}
+
+/**
+ * Схема «как у пользователя» для X-Forwarded-Proto / CF-Visitor / Forwarded (не путать с upstream_use_http).
+ */
+function resolveUpstreamReportedProto(array $config): string
+{
+    $mode = $config['upstream_reported_proto'] ?? 'https';
+    if ($mode === 'https') {
+        return 'https';
+    }
+    if ($mode === 'http') {
+        return 'http';
+    }
+
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        return 'https';
+    }
+
+    $xf = strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if ($xf === 'https' || $xf === 'on') {
+        return 'https';
+    }
+
+    if (($_SERVER['REQUEST_SCHEME'] ?? '') === 'https') {
+        return 'https';
+    }
+
+    return 'http';
+}
+
+function forwardedHeaderForParam(string $clientIp): string
+{
+    if (filter_var($clientIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        return '"[' . $clientIp . ']"';
+    }
+
+    return '"' . $clientIp . '"';
+}
+
+/**
+ * RFC 7239: одна строка Forwarded; host — имя на origin (как в Host), чтобы приложение видело канонический домен.
+ */
+function buildForwardedRfc7239Header(string $clientIp, string $proto, string $hostForOrigin): string
+{
+    $for = forwardedHeaderForParam($clientIp);
+
+    return 'Forwarded: for=' . $for . ';proto=' . $proto . ';host=' . $hostForOrigin;
 }
 
 function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
@@ -405,10 +657,15 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
             'x-forwarded-for',
             'x-forwarded-host',
             'x-forwarded-proto',
+            'x-forwarded-port',
             'x-forwarded-public-host',
             'x-real-ip',
             'forwarded',
             'x-original-host',
+            'x-https',
+            'front-end-https',
+            'x-forwarded-ssl',
+            'x-url-scheme',
         ], true)) {
             continue;
         }
@@ -421,34 +678,64 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
         $fromClient[] = $name . ': ' . $value;
     }
 
-    $hostHeader = $config['preserve_original_host_header'] ? $incomingHost : $upstreamHost;
+    // HTTP к origin: часть nginx/FastPanel реагирует на «клиентский HTTPS» (X-HTTPS и т.п.) и отдаёт заглушку вместо vhost.
+    // В verify без этих заголовков ответ корректный — вырезаем по имени строки, даже если getallheaders дал иной регистр.
+    if (!empty($config['upstream_use_http'])) {
+        $stripNames = [
+            'x-https',
+            'front-end-https',
+            'x-forwarded-ssl',
+            'x-url-scheme',
+        ];
+        $fromClient = array_values(array_filter(
+            $fromClient,
+            static function (string $line) use ($stripNames): bool {
+                if (!preg_match('/^([^\s:]+)\s*:/', $line, $m)) {
+                    return true;
+                }
 
-    // Минимум как у прямого HTTPS к ru.won.onl: только Host (и SNI из URL). Без X-Forwarded-Host/Forwarded —
-    // иначе LiteSpeed/FastPanel иногда выбирают vhost не по Host и отдают заглушку.
+                return !in_array(strtolower($m[1]), $stripNames, true);
+            }
+        ));
+    }
+
+    $hostHeader = $config['preserve_original_host_header'] ? $incomingHost : $upstreamHost;
+    $reportedProto = resolveUpstreamReportedProto($config);
+    $reportedPort = $reportedProto === 'https' ? '443' : '80';
+
+    // Host + SNI в URL уже задают vhost; далее — согласованные «внешние» proto/host/port для фреймворков (см. TZ.md).
     $core = [
         'Host: ' . $hostHeader,
-        'X-Forwarded-For: ' . $forwardedFor,
-        'X-Real-IP: ' . $clientIp,
-        'X-Forwarded-Proto: https',
     ];
 
     if (($config['mimic_cloudflare_to_origin'] ?? true)) {
-        // Как у Cloudflare к origin: реальный IP посетителя и схема (часть бэкендов ожидают именно CF-*).
-        array_splice($core, 1, 0, [
-            'CF-Connecting-IP: ' . $clientIp,
-            'CF-Visitor: {"scheme":"https"}',
-        ]);
+        $core[] = 'CF-Connecting-IP: ' . $clientIp;
+        $core[] = 'CF-Visitor: {"scheme":"' . $reportedProto . '"}';
         $cc = isset($config['mimic_cf_ip_country']) ? trim((string) $config['mimic_cf_ip_country']) : '';
         if ($cc !== '' && strlen($cc) === 2) {
-            array_splice($core, 3, 0, ['CF-IPCountry: ' . strtoupper($cc)]);
+            $core[] = 'CF-IPCountry: ' . strtoupper($cc);
         }
     }
 
+    $core[] = 'X-Forwarded-For: ' . $forwardedFor;
+    $core[] = 'X-Real-IP: ' . $clientIp;
+    $core[] = 'X-Forwarded-Proto: ' . $reportedProto;
+
+    if (!empty($config['upstream_x_forwarded_port'])) {
+        $core[] = 'X-Forwarded-Port: ' . $reportedPort;
+    }
+
+    $rfc7239 = $config['upstream_forwarded_rfc7239'] ?? true;
+    if ($rfc7239) {
+        $core[] = buildForwardedRfc7239Header($clientIp, $reportedProto, $hostHeader);
+    }
+
+    // Дополнительно: X-Forwarded-Host (иногда ломает выбор vhost у панелей — держите false, если заглушка).
     if (!empty($config['upstream_extra_forward_headers'])) {
-        array_splice($core, 1, 0, [
-            'X-Forwarded-Host: ' . $hostHeader,
-            'Forwarded: for="' . $clientIp . '";host="' . $hostHeader . '";proto=https',
-        ]);
+        $core[] = 'X-Forwarded-Host: ' . $hostHeader;
+        if (!$rfc7239) {
+            $core[] = buildForwardedRfc7239Header($clientIp, $reportedProto, $hostHeader);
+        }
     }
 
     if (!empty($config['send_public_host_header']) && $incomingHost !== $upstreamHost) {
@@ -752,4 +1039,155 @@ function curlErrorHint(int $curlErrno, array $config, string $curlError = ''): s
     }
 
     return 'См. curl_errno в деталях выше и документацию cURL.';
+}
+
+/**
+ * Диагностика: как origin отвечает на запрос «как прокси» (заголовки, порты, превью тела).
+ * Не вызывает exit; для verify.php при define(PROXY_SKIP_MAIN, true).
+ *
+ * @return list<array<string, mixed>>
+ */
+function upstreamDebugProbe(
+    array $config,
+    string $incomingHost,
+    string $upstreamHost,
+    string $clientIp,
+    string $requestPath,
+    int $bodyPreviewMax = 2000
+): array {
+    $path = $requestPath === '' ? '/' : $requestPath;
+    if ($path === '' || $path[0] !== '/') {
+        $path = '/' . ltrim($path, '/');
+    }
+
+    $attempts = [];
+
+    $probeOne = static function (
+        array $cfg,
+        string $label,
+        string $upstreamHostInner,
+        string $incomingHostInner,
+        string $clientIpInner,
+        array $configInner,
+        ?string $resolveLine,
+        string $url,
+        int $bodyPreviewMaxInner
+    ): array {
+        $requestHeaders = buildUpstreamHeaders($incomingHostInner, $upstreamHostInner, $clientIpInner, $cfg);
+        $responseHeaders = [];
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return [
+                'label' => $label,
+                'url' => $url,
+                'curl_resolve' => $resolveLine,
+                'request_headers' => $requestHeaders,
+                'error' => 'curl_init failed',
+            ];
+        }
+
+        $curlOpts = [
+            CURLOPT_CUSTOMREQUEST => 'GET',
+            CURLOPT_HTTPHEADER => $requestHeaders,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER => false,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_ENCODING => '',
+            CURLOPT_CONNECTTIMEOUT => $cfg['timeout'] ?? 60,
+            CURLOPT_TIMEOUT => $cfg['timeout'] ?? 60,
+            CURLOPT_SSL_VERIFYPEER => (bool) ($cfg['verify_upstream_tls'] ?? false),
+            CURLOPT_SSL_VERIFYHOST => !empty($cfg['verify_upstream_tls']) ? 2 : 0,
+            CURLOPT_HEADERFUNCTION => static function ($curl, string $headerLine) use (&$responseHeaders): int {
+                $trimmed = trim($headerLine);
+                if ($trimmed !== '') {
+                    $responseHeaders[] = $trimmed;
+                }
+
+                return strlen($headerLine);
+            },
+        ];
+
+        if ($resolveLine !== null) {
+            $curlOpts[CURLOPT_RESOLVE] = [$resolveLine];
+        }
+
+        curl_setopt_array($ch, $curlOpts);
+
+        $body = curl_exec($ch);
+        $curlErrno = curl_errno($ch);
+        $curlError = curl_error($ch);
+        $info = curl_getinfo($ch);
+        curl_close($ch);
+
+        $bodyStr = $body === false ? '' : (string) $body;
+        $preview = $bodyStr;
+        if (strlen($preview) > $bodyPreviewMaxInner) {
+            $preview = substr($preview, 0, $bodyPreviewMaxInner) . "\n... [truncated]";
+        }
+
+        $fastpanel = isFastPanelStaticPlaceholder($bodyStr);
+
+        return [
+            'label' => $label,
+            'url' => $url,
+            'curl_resolve' => $resolveLine,
+            'request_headers' => $requestHeaders,
+            'curl_errno' => $curlErrno,
+            'curl_error' => $curlError,
+            'http_status' => (int) ($info['http_code'] ?? 0),
+            'content_type' => (string) ($info['content_type'] ?? ''),
+            'primary_ip' => (string) ($info['primary_ip'] ?? ''),
+            'primary_port' => (int) ($info['primary_port'] ?? 0),
+            'ssl_verify_result' => (int) ($info['ssl_verify_result'] ?? 0),
+            'appconnect_time_us' => (int) ($info['appconnect_time_us'] ?? 0),
+            'total_time_us' => (int) (($info['total_time'] ?? 0) * 1_000_000),
+            'response_headers' => $responseHeaders,
+            'body_preview' => $preview,
+            'body_length' => strlen($bodyStr),
+            'hint_fastpanel_placeholder' => $fastpanel,
+            'hint' => $curlErrno !== 0 ? curlErrorHint($curlErrno, $configInner, $curlError) : '',
+        ];
+    };
+
+    foreach (upstreamHttpsPortPriority($config) as $port) {
+        $cfgH = array_merge($config, [
+            'upstream_use_http' => false,
+            'upstream_direct_port' => $port,
+        ]);
+        $url = buildUpstreamUrlWithPath($upstreamHost, $cfgH, $path);
+        $resolve = buildCurlResolve($upstreamHost, $cfgH);
+        $attempts[] = $probeOne(
+            $cfgH,
+            'HTTPS :' . $port,
+            $upstreamHost,
+            $incomingHost,
+            $clientIp,
+            $config,
+            $resolve,
+            $url,
+            $bodyPreviewMax
+        );
+    }
+
+    $cfgHttp = array_merge($config, [
+        'upstream_use_http' => true,
+        'upstream_direct_port' => (int) ($config['retry_http_port'] ?? 80),
+    ]);
+    $urlHttp = buildUpstreamUrlWithPath($upstreamHost, $cfgHttp, $path);
+    $resolveHttp = buildCurlResolve($upstreamHost, $cfgHttp);
+    $attempts[] = $probeOne(
+        $cfgHttp,
+        'HTTP :' . (int) ($cfgHttp['upstream_direct_port']),
+        $upstreamHost,
+        $incomingHost,
+        $clientIp,
+        $config,
+        $resolveHttp,
+        $urlHttp,
+        $bodyPreviewMax
+    );
+
+    return $attempts;
 }

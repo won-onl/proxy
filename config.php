@@ -40,14 +40,36 @@ return [
     // Двухбуквенный код страны для CF-IPCountry (если пусто — заголовок не шлём).
     'mimic_cf_ip_country' => '',
 
-    // Порт upstream (443 для HTTPS, 80 для HTTP если включён upstream_use_http).
-    'upstream_direct_port' => 443,
+    // Какую схему сообщать origin в X-Forwarded-Proto / CF-Visitor / Forwarded (как «внешний» URL для приложения).
+    // https — всегда (типично: зеркало открывают по HTTPS; origin не должен строить http://-ссылки).
+    // auto — по запросу к зеркалу (HTTPS, X-Forwarded-Proto от nginx, REQUEST_SCHEME).
+    // http — редко; только если осознанно нужен http в абсолютных URL на origin.
+    'upstream_reported_proto' => 'https',
 
-    // Ходить на origin по HTTP (как Cloudflare Flexible: только порт 80 на сервер).
-    'upstream_use_http' => false,
+    // Добавить X-Forwarded-Port (443/80 в соответствии с upstream_reported_proto). Часто нужно для корректных абсолютных URL.
+    'upstream_x_forwarded_port' => true,
+
+    // RFC 7239: Forwarded: for=…;proto=…;host=… — host = имя на origin (upstream), чтобы фреймворки видели канонический хост.
+    // Отключите, если веб-панель на origin некорректно обрабатывает Forwarded.
+    'upstream_forwarded_rfc7239' => true,
+
+    // Порт TCP к upstream_direct_ip. Для HTTPS к origin верните 443 и upstream_use_http => false.
+    // Для HTTP к origin (как verify) — 80 и upstream_use_http => true.
+    'upstream_direct_port' => 80,
+
+    // Порты HTTPS к origin в порядке приоритета (сначала upstream_direct_port, затем остальные без дублей).
+    // Если :443 закрыт, а TLS на другом порту — добавьте его сюда (см. TZ.md).
+    'upstream_https_port_priority' => [443],
+
+    // true = всегда http://…:80 к origin (как успешная попытка verify). На origin реальный сайт на :80, на :443 — заглушка.
+    'upstream_use_http' => true,
 
     // Если HTTPS к origin падает с ошибкой TLS (часто при Flexible), один раз повторить запрос по HTTP.
     'retry_upstream_http_on_ssl_failure' => true,
+
+    // Если HTTPS к origin возвращает 200, но тело — статическая заглушка FASTPANEL на :443, а реальный сайт на :80
+    // (verify: HTTPS = FASTPANEL, HTTP = игра) — один раз повторить по HTTP (как ниже, retry_http_port).
+    'retry_upstream_http_on_fastpanel_placeholder' => true,
 
     // Порт для повтора по HTTP (обычно 80).
     'retry_http_port' => 80,
@@ -97,4 +119,7 @@ return [
 
     // On fatal PHP errors, try to output a visible HTML page (needs show_debug_errors or always on for fatals).
     'show_fatal_errors' => true,
+
+    // Если непустая строка — /verify.php с полной диагностикой origin только с ?key=этой_строке (иначе 403).
+    'verify_debug_secret' => '',
 ];

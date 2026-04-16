@@ -40,6 +40,21 @@ FastPanel на стороне won.onl (origin) — что проверить
 • Wildcard *.won-onl.ru: DNS A/AAAA на IP РФ-сервера + в панели алиас/поддомены,
   если панель это поддерживает.
 
+Страница FastPanel «Why am I seeing this page?» в браузере на won-onl.ru
+-----------------------------------------------------------------------
+
+1) В адресной строке won-onl.ru, но ответ — как у FastPanel?  
+   Откройте /verify.php в корне зеркала. Если НЕ видите строку «proxy_wononl_ru_ok»,
+   то запрос НЕ попадает на РФ-хостинг с прокси. Частая ошибка: A-запись won-onl.ru
+   указывает на IP сервера FastVPS (тот же, что won.onl). Тогда браузер сразу
+   стучится на origin с Host: won-onl.ru — сайта с таким именем на FastVPS нет →
+   заглушка панели. Исправление: A/AAAA для won-onl.ru → только IP РФ-хостинга.
+
+2) Если /verify.php показывает «ok», а прокси всё равно отдаёт страницу с origin,
+   на FastVPS в FASTPANEL должен быть создан сайт с именем, которое шлёт прокси
+   (например ru.won.onl для корня зеркала). Host и SNI в curl = это имя;
+   upstream_direct_ip в config.php должен быть задан на сервере.
+
 Полезные ссылки FASTPANEL (если origin на FastVPS)
 --------------------------------------------------
 • https://kb.fastpanel.direct/sites/site-settings/

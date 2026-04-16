@@ -395,8 +395,10 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
             'x-forwarded-for',
             'x-forwarded-host',
             'x-forwarded-proto',
+            'x-forwarded-public-host',
             'x-real-ip',
             'forwarded',
+            'x-original-host',
         ], true)) {
             continue;
         }
@@ -412,16 +414,14 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
     $hostHeader = $config['preserve_original_host_header'] ? $incomingHost : $upstreamHost;
     $headers[] = 'Host: ' . $hostHeader;
 
-    // На origin (хостинг won.onl) vhost часто выбирается по X-Forwarded-Host / Forwarded.
-    // Имя won-onl.ru там нет — отдаётся «Why am I seeing this page?». На upstream всегда
-    // передаём «родной» host игры (*.won.onl), как в Host.
+    // Origin не знает won-onl.ru — только *.won.onl. Все эти поля = upstreamHost.
     $headers[] = 'X-Forwarded-Host: ' . $hostHeader;
     $headers[] = 'X-Forwarded-Proto: https';
     $headers[] = 'X-Forwarded-For: ' . $forwardedFor;
     $headers[] = 'X-Real-IP: ' . $clientIp;
     $headers[] = 'Forwarded: for="' . $clientIp . '";host="' . $hostHeader . '";proto=https';
 
-    // Реальное имя из браузера (для приложений, которым нужен публичный домен РФ).
+    // Опционально: пробросить won-onl.ru на origin (обычно не нужно — ломает модель «только won.onl»).
     if (!empty($config['send_public_host_header']) && $incomingHost !== $upstreamHost) {
         $headers[] = 'X-Forwarded-Public-Host: ' . $incomingHost;
     }
@@ -470,6 +470,29 @@ function emitResponse(array $response, string $incomingHost, string $upstreamHos
         }
     }
 
+    if ($contentType === '' && !empty($response['content_type'])) {
+        $contentType = trim((string) $response['content_type']);
+    }
+
+    $body = $response['body'];
+
+    if (
+        is_string($body)
+        && $body === ''
+        && $response['status'] >= 200
+        && $response['status'] < 300
+        && !empty($config['show_debug_errors'])
+    ) {
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Прокси: пустой ответ</title></head><body>';
+        echo '<h1>Пустой ответ от origin</h1>';
+        echo '<p>Upstream host: <code>' . htmlspecialchars($upstreamHost, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</code></p>';
+        echo '<p>Задайте в <code>config.php</code> прямой <code>upstream_direct_ip</code> (обход Cloudflare из РФ), проверьте SSL (upstream_use_http) и что на origin есть vhost для этого имени.</p>';
+        echo '</body></html>';
+
+        return;
+    }
+
     foreach ($response['headers'] as $headerLine) {
         if (stripos($headerLine, 'HTTP/') === 0) {
             continue;
@@ -500,19 +523,34 @@ function emitResponse(array $response, string $incomingHost, string $upstreamHos
         header($headerLine, false);
     }
 
-    $body = $response['body'];
-
-    if (
-        $config['rewrite_response_bodies']
+    $rewriteOk = $config['rewrite_response_bodies']
         && is_string($body)
         && strlen($body) <= (int) $config['rewrite_body_max_bytes']
-        && shouldRewriteBody($contentType)
-    ) {
+        && (shouldRewriteBody($contentType) || bodyLooksLikeRewritableWithoutContentType($body, $contentType));
+
+    if ($rewriteOk) {
         $body = rewriteBody($body, $incomingHost, $upstreamHost, $config);
+    }
+
+    if ($contentType === '' && is_string($body) && strlen($body) > 0 && preg_match('/^\s*</', $body)) {
+        header('Content-Type: text/html; charset=utf-8', true);
     }
 
     header('Content-Length: ' . strlen((string) $body), true);
     echo $body;
+}
+
+function bodyLooksLikeRewritableWithoutContentType(string $body, string $contentType): bool
+{
+    if ($contentType !== '') {
+        return false;
+    }
+
+    $trim = ltrim(substr($body, 0, 4096));
+
+    return str_starts_with($trim, '<')
+        || str_starts_with($trim, '{')
+        || str_starts_with($trim, '/');
 }
 
 function rewriteSetCookieHeader(string $headerLine, array $config): string

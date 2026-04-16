@@ -1,0 +1,6 @@
+RewriteEngine On
+
+# Route all requests through the PHP reverse proxy.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [QSA,L]

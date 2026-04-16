@@ -77,6 +77,15 @@ function resolveUpstreamHost(string $incomingHost, array $config): ?string
 
     $publicBase = strtolower($config['public_base_domain']);
     $upstreamBase = strtolower($config['upstream_base_domain']);
+    $aliases = array_map(
+        static fn (string $h): string => strtolower(trim($h)),
+        $config['public_host_aliases'] ?? []
+    );
+
+    // www и прочие алиасы → тот же upstream, что у корня (won.onl), не www.won.onl.
+    if (in_array($incomingHost, $aliases, true)) {
+        return $config['allow_root_domain'] ? $upstreamBase : $config['fallback_upstream_host'];
+    }
 
     if ($incomingHost === $publicBase) {
         return $config['allow_root_domain'] ? $upstreamBase : $config['fallback_upstream_host'];

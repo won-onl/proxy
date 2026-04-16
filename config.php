@@ -2,6 +2,12 @@
 
 declare(strict_types=1);
 
+/*
+ * Хостинг: в панели (LiteSpeed/cPanel) добавьте домен won-onl.ru к ЭТОМУ каталогу (public_html),
+ * включите SSL для домена. Иначе будет страница «Why am I seeing this page?» — веб-сервер не
+ * отдаёт site/PHP для этого Host, прокси не запускается.
+ */
+
 return [
     // The upstream zone that hosts the real game (Host / SNI / переписывание ссылок).
     'upstream_base_domain' => 'won.onl',
@@ -17,9 +23,14 @@ return [
     // Ходить на origin по HTTP (без TLS), resolve всё равно на upstream_direct_ip.
     'upstream_use_http' => false,
 
-    // The public RU domain that points to this proxy.
-    // Example: mirror.ru
+    // Основной домен в браузере (без поддомена = как won.onl на origin).
     'public_base_domain' => 'won-onl.ru',
+
+    // Дополнительные имена, которые ведут на тот же upstream, что и корень (apex → won.onl).
+    // Например www часто не создают отдельным сайтом в панели.
+    'public_host_aliases' => [
+        'www.won-onl.ru',
+    ],
 
     // If true, requests to the bare public domain will proxy to the bare upstream domain.
     'allow_root_domain' => true,

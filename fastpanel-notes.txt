@@ -1,0 +1,46 @@
+Архитектура (важно)
+===================
+
+• Игра / целевой сайт — домен won.onl, сервер на FastVPS (FASTPANEL). Прокси шлёт Host
+  как у нужного поддомена *.won.onl; голый won-onl.ru в конфиге может маппиться на
+  ru.won.onl (см. public_apex_upstream_subdomain в config.php).
+
+• Прокси (PHP: index.php, proxy.php) — на ОТДЕЛЬНОМ российском хостинге/VPS.
+  В браузере игроков — зона won-onl.ru (DNS → IP именно РФ-сервера).
+
+FastPanel на стороне won.onl (origin) — что проверить
+=====================================================
+
+Прямые запросы с РФ-хостинга к IP origin (тот адрес, что в DNS A у won.onl) НЕ идут через Cloudflare.
+На сервере игры должно быть разрешено:
+
+• Файрвол / security: если стоит ограничение «только IP Cloudflare» — добавьте
+  в whitelist IP вашего РФ-VPS (откуда идёт cURL прокси).
+
+• Cloudflare «Authenticated Origin Pulls» / строгая проверка клиентского сертификата
+  к origin — прямой cURL с РФ может блокироваться; отключение или исключение для
+  вашего сценария — на стороне панели/origin.
+
+• Режим SSL CF→origin (Flexible / Full) влияет на то, слушает ли origin :80 или :443;
+  в config.php уже есть upstream_use_http и retry на HTTP при ошибке TLS.
+
+Российский хостинг (где лежит только прокси, won-onl.ru)
+========================================================
+
+Здесь НЕ обязательно FastPanel — может быть Beget, Timeweb, shared и т.д.
+
+• Создать сайт с доменом won-onl.ru, указать document root, куда залиты index.php,
+  proxy.php, config.php.
+
+• SSL для won-onl.ru на ЭТОМ сервере (Let’s Encrypt и т.п.) — для игроков из РФ.
+
+• Чтобы все пути шли в index.php: либо работающий .htaccess (Apache), либо для
+  Nginx+PHP-FPM — try_files → /index.php (см. nginx-php-fpm-snippet.conf).
+
+• Wildcard *.won-onl.ru: DNS A/AAAA на IP РФ-сервера + в панели алиас/поддомены,
+  если панель это поддерживает.
+
+Полезные ссылки FASTPANEL (если origin на FastVPS)
+--------------------------------------------------
+• https://kb.fastpanel.direct/sites/site-settings/
+• https://kb.fastpanel.direct/sites/how-to-change-a-php-mode/

@@ -69,6 +69,46 @@ function getIncomingHost(): string
     return $host;
 }
 
+/**
+ * Имя на origin для запросов к голому зеркалу (won-onl.ru): ru.won.onl или won.onl.
+ */
+function apexUpstreamHostname(array $config): string
+{
+    $upstreamBase = strtolower($config['upstream_base_domain']);
+    $apex = trim((string) ($config['public_apex_upstream_subdomain'] ?? ''));
+
+    return $apex === '' ? $upstreamBase : $apex . '.' . $upstreamBase;
+}
+
+/**
+ * Какой Host в браузере соответствует имени на origin (*.won.onl).
+ */
+function publicHostForUpstreamHostname(string $hostname, array $config): string
+{
+    $hostname = strtolower($hostname);
+    $upstreamBase = strtolower($config['upstream_base_domain']);
+    $publicBase = strtolower($config['public_base_domain']);
+    $apex = trim((string) ($config['public_apex_upstream_subdomain'] ?? ''));
+
+    if ($hostname === $upstreamBase) {
+        return $publicBase;
+    }
+
+    if ($apex !== '' && $hostname === $apex . '.' . $upstreamBase) {
+        return $publicBase;
+    }
+
+    $suf = '.' . $upstreamBase;
+    if (str_ends_with($hostname, $suf)) {
+        $sub = substr($hostname, 0, -strlen($suf));
+        if ($sub !== '' && preg_match('/^[a-z0-9.-]+$/', $sub)) {
+            return $sub . '.' . $publicBase;
+        }
+    }
+
+    return $hostname;
+}
+
 function resolveUpstreamHost(string $incomingHost, array $config): ?string
 {
     if ($incomingHost === '') {
@@ -82,13 +122,15 @@ function resolveUpstreamHost(string $incomingHost, array $config): ?string
         $config['public_host_aliases'] ?? []
     );
 
-    // www и прочие алиасы → тот же upstream, что у корня (won.onl), не www.won.onl.
+    $apexHost = apexUpstreamHostname($config);
+
+    // Алиасы и голый домен → один upstream (например ru.won.onl), не www.won.onl.
     if (in_array($incomingHost, $aliases, true)) {
-        return $config['allow_root_domain'] ? $upstreamBase : $config['fallback_upstream_host'];
+        return $config['allow_root_domain'] ? $apexHost : $config['fallback_upstream_host'];
     }
 
     if ($incomingHost === $publicBase) {
-        return $config['allow_root_domain'] ? $upstreamBase : $config['fallback_upstream_host'];
+        return $config['allow_root_domain'] ? $apexHost : $config['fallback_upstream_host'];
     }
 
     $suffix = '.' . $publicBase;
@@ -104,6 +146,34 @@ function resolveUpstreamHost(string $incomingHost, array $config): ?string
     }
 
     return $subdomain . '.' . $upstreamBase;
+}
+
+/**
+ * В строке заголовка (Origin, Referer) заменить URL с зеркала на эквивалент *.won.onl.
+ */
+function rewritePublicUrlsToUpstream(string $value, array $config): string
+{
+    if ($value === '') {
+        return $value;
+    }
+
+    $out = preg_replace_callback(
+        '/(https?:\/\/)([^\/\s:]+)(?::(\d+))?(\/[^\s]*)?/i',
+        static function (array $m) use ($config): string {
+            $host = strtolower($m[2]);
+            $upstream = resolveUpstreamHost($host, $config);
+            if ($upstream === null) {
+                return $m[0];
+            }
+            $port = isset($m[3]) && $m[3] !== '' ? ':' . $m[3] : '';
+            $path = $m[4] ?? '';
+
+            return $m[1] . $upstream . $port . $path;
+        },
+        $value
+    );
+
+    return is_string($out) ? $out : $value;
 }
 
 function buildUpstreamUrl(string $upstreamHost, array $config): string
@@ -145,8 +215,23 @@ function buildCurlResolve(string $upstreamHost, array $config): ?string
     return $upstreamHost . ':' . $port . ':' . $ip;
 }
 
-function proxyRequest(string $url, string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
+function isCurlSslError(int $errno): bool
 {
+    return in_array($errno, [35, 51, 58, 60, 77], true);
+}
+
+/**
+ * @return array{body: string|false, curl_errno: int, curl_error: string, status: int, content_type: string, response_headers: string[]}
+ */
+function executeUpstreamCurl(
+    string $url,
+    string $incomingHost,
+    string $upstreamHost,
+    string $clientIp,
+    array $config,
+    ?string $resolveLine,
+    string $requestBody
+): array {
     $ch = curl_init($url);
 
     if ($ch === false) {
@@ -156,7 +241,6 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
     $requestHeaders = buildUpstreamHeaders($incomingHost, $upstreamHost, $clientIp, $config);
     $responseHeaders = [];
 
-    $resolveLine = buildCurlResolve($upstreamHost, $config);
     $curlOpts = [
         CURLOPT_CUSTOMREQUEST => $_SERVER['REQUEST_METHOD'] ?? 'GET',
         CURLOPT_HTTPHEADER => $requestHeaders,
@@ -185,16 +269,8 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
 
     curl_setopt_array($ch, $curlOpts);
 
-    $requestBody = file_get_contents('php://input');
-    if ($requestBody !== false && $requestBody !== '') {
+    if ($requestBody !== '') {
         curl_setopt($ch, CURLOPT_POSTFIELDS, $requestBody);
-    }
-
-    if (isWebSocketHandshake()) {
-        // PHP+cURL cannot transparently tunnel upgraded WebSocket frames after handshake.
-        respondWithError($config, 501, 'WebSocket через этот PHP-прокси не поддерживается', [
-            'hint' => 'Нужен Nginx/OpenResty с proxy_pass на upstream или отдельный прокси.',
-        ]);
     }
 
     $body = curl_exec($ch);
@@ -204,33 +280,97 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
     $contentType = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);
 
-    if ($body === false) {
-        // 28 = CURLE_OPERATION_TIMEDOUT (число — на части хостингов константа не объявлена)
-        $httpCode = $curlErrno === 28 ? 504 : 502;
-        respondWithError($config, $httpCode, 'Нет ответа от upstream (ошибка cURL)', [
-            'upstream_url' => $url,
-            'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
-            'curl_errno' => $curlErrno,
-            'curl_error' => $curlError,
-            'hint' => curlErrorHint($curlErrno, $config, $curlError),
+    return [
+        'body' => $body,
+        'curl_errno' => $curlErrno,
+        'curl_error' => $curlError,
+        'status' => $status,
+        'content_type' => $contentType,
+        'response_headers' => $responseHeaders,
+    ];
+}
+
+function proxyRequest(string $url, string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
+{
+    $rawBody = file_get_contents('php://input');
+    $requestBody = $rawBody !== false ? (string) $rawBody : '';
+
+    if (isWebSocketHandshake()) {
+        // PHP+cURL cannot transparently tunnel upgraded WebSocket frames after handshake.
+        respondWithError($config, 501, 'WebSocket через этот PHP-прокси не поддерживается', [
+            'hint' => 'Нужен Nginx/OpenResty с proxy_pass на upstream или отдельный прокси.',
         ]);
     }
 
-    if ($status === 0) {
+    $resolveLine = buildCurlResolve($upstreamHost, $config);
+    $result = executeUpstreamCurl($url, $incomingHost, $upstreamHost, $clientIp, $config, $resolveLine, $requestBody);
+
+    $failed = $result['body'] === false || $result['status'] === 0;
+
+    if (
+        $failed
+        && empty($config['upstream_use_http'])
+        && !empty($config['retry_upstream_http_on_ssl_failure'])
+        && $result['body'] === false
+        && isCurlSslError($result['curl_errno'])
+    ) {
+        $cfgHttp = array_merge($config, [
+            'upstream_use_http' => true,
+            'upstream_direct_port' => (int) ($config['retry_http_port'] ?? 80),
+        ]);
+        $urlHttp = buildUpstreamUrl($upstreamHost, $cfgHttp);
+        $resolveHttp = buildCurlResolve($upstreamHost, $cfgHttp);
+        $resultHttp = executeUpstreamCurl($urlHttp, $incomingHost, $upstreamHost, $clientIp, $cfgHttp, $resolveHttp, $requestBody);
+
+        if ($resultHttp['body'] !== false && $resultHttp['status'] !== 0) {
+            return [
+                'status' => $resultHttp['status'],
+                'headers' => $resultHttp['response_headers'],
+                'body' => $resultHttp['body'],
+                'content_type' => $resultHttp['content_type'],
+            ];
+        }
+
+        respondWithError($config, 502, 'Нет ответа от upstream (HTTPS и HTTP fallback)', [
+            'https_upstream_url' => $url,
+            'https_curl_resolve' => $resolveLine ?? '(DNS как обычно)',
+            'https_curl_errno' => $result['curl_errno'],
+            'https_curl_error' => $result['curl_error'],
+            'http_upstream_url' => $urlHttp,
+            'http_curl_resolve' => $resolveHttp ?? '(DNS как обычно)',
+            'http_curl_errno' => $resultHttp['curl_errno'],
+            'http_curl_error' => $resultHttp['curl_error'],
+            'hint' => 'Проверьте SSL-режим Cloudflare (Flexible → HTTP:80) и что origin принимает прямые запросы не только от CF.',
+        ]);
+    }
+
+    if ($result['body'] === false) {
+        // 28 = CURLE_OPERATION_TIMEDOUT
+        $httpCode = $result['curl_errno'] === 28 ? 504 : 502;
+        respondWithError($config, $httpCode, 'Нет ответа от upstream (ошибка cURL)', [
+            'upstream_url' => $url,
+            'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
+            'curl_errno' => $result['curl_errno'],
+            'curl_error' => $result['curl_error'],
+            'hint' => curlErrorHint($result['curl_errno'], $config, $result['curl_error']),
+        ]);
+    }
+
+    if ($result['status'] === 0) {
         respondWithError($config, 502, 'Upstream вернул HTTP 0 (соединение оборвано или TLS сбой)', [
             'upstream_url' => $url,
             'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
-            'curl_errno' => $curlErrno,
-            'curl_error' => $curlError ?: '(пусто)',
-            'hint' => curlErrorHint($curlErrno, $config, $curlError),
+            'curl_errno' => $result['curl_errno'],
+            'curl_error' => $result['curl_error'] ?: '(пусто)',
+            'hint' => curlErrorHint($result['curl_errno'], $config, $result['curl_error']),
         ]);
     }
 
     return [
-        'status' => $status,
-        'headers' => $responseHeaders,
-        'body' => $body,
-        'content_type' => $contentType,
+        'status' => $result['status'],
+        'headers' => $result['response_headers'],
+        'body' => $result['body'],
+        'content_type' => $result['content_type'],
     ];
 }
 
@@ -261,16 +401,30 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
             continue;
         }
 
+        // Браузер шлёт Origin/Referer с won-onl.ru — часть хостингов по ним выбирает vhost.
+        if (in_array($lowerName, ['origin', 'referer'], true)) {
+            $value = rewritePublicUrlsToUpstream($value, $config);
+        }
+
         $headers[] = $name . ': ' . $value;
     }
 
     $hostHeader = $config['preserve_original_host_header'] ? $incomingHost : $upstreamHost;
     $headers[] = 'Host: ' . $hostHeader;
-    $headers[] = 'X-Forwarded-Host: ' . $incomingHost;
+
+    // На origin (хостинг won.onl) vhost часто выбирается по X-Forwarded-Host / Forwarded.
+    // Имя won-onl.ru там нет — отдаётся «Why am I seeing this page?». На upstream всегда
+    // передаём «родной» host игры (*.won.onl), как в Host.
+    $headers[] = 'X-Forwarded-Host: ' . $hostHeader;
     $headers[] = 'X-Forwarded-Proto: https';
     $headers[] = 'X-Forwarded-For: ' . $forwardedFor;
     $headers[] = 'X-Real-IP: ' . $clientIp;
-    $headers[] = 'Forwarded: for="' . $clientIp . '";host="' . $incomingHost . '";proto=https';
+    $headers[] = 'Forwarded: for="' . $clientIp . '";host="' . $hostHeader . '";proto=https';
+
+    // Реальное имя из браузера (для приложений, которым нужен публичный домен РФ).
+    if (!empty($config['send_public_host_header']) && $incomingHost !== $upstreamHost) {
+        $headers[] = 'X-Forwarded-Public-Host: ' . $incomingHost;
+    }
 
     return $headers;
 }
@@ -376,15 +530,19 @@ function rewriteSetCookieHeader(string $headerLine, array $config): string
 function rewriteLocationHeader(string $headerLine, string $incomingHost, string $upstreamHost, array $config): string
 {
     $value = trim(substr($headerLine, strlen('Location:')));
-    $publicBase = $config['public_base_domain'];
     $upstreamBase = $config['upstream_base_domain'];
 
     $rewritten = preg_replace_callback(
         '/https:\/\/([a-z0-9.-]+\.)?' . preg_quote($upstreamBase, '/') . '([\/?#][^\s]*)?/i',
-        static function (array $matches) use ($publicBase): string {
+        static function (array $matches) use ($config): string {
             $sub = $matches[1] ?? '';
-            $suffix = $matches[2] ?? '';
-            return 'https://' . $sub . $publicBase . $suffix;
+            $pathSuffix = $matches[2] ?? '';
+            $hostOnOrigin = $sub === ''
+                ? $config['upstream_base_domain']
+                : rtrim($sub, '.') . '.' . $config['upstream_base_domain'];
+            $public = publicHostForUpstreamHostname($hostOnOrigin, $config);
+
+            return 'https://' . $public . $pathSuffix;
         },
         $value
     );
@@ -414,7 +572,6 @@ function shouldRewriteBody(string $contentType): bool
 
 function rewriteBody(string $body, string $incomingHost, string $upstreamHost, array $config): string
 {
-    $publicBase = $config['public_base_domain'];
     $upstreamBase = $config['upstream_base_domain'];
 
     $subdomain = '';
@@ -439,9 +596,14 @@ function rewriteBody(string $body, string $incomingHost, string $upstreamHost, a
 
     return preg_replace_callback(
         '/https:\/\/([a-z0-9.-]+\.)?' . preg_quote($upstreamBase, '/') . '/i',
-        static function (array $matches) use ($publicBase): string {
+        static function (array $matches) use ($config): string {
             $sub = $matches[1] ?? '';
-            return 'https://' . $sub . $publicBase;
+            $hostOnOrigin = $sub === ''
+                ? $config['upstream_base_domain']
+                : rtrim($sub, '.') . '.' . $config['upstream_base_domain'];
+            $public = publicHostForUpstreamHostname($hostOnOrigin, $config);
+
+            return 'https://' . $public;
         },
         $body
     ) ?? $body;

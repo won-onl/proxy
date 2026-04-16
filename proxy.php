@@ -35,6 +35,15 @@ main($config);
 
 function main(array $config): void
 {
+    if (!empty($config['require_upstream_direct_ip'])) {
+        $dip = trim((string) ($config['upstream_direct_ip'] ?? ''));
+        if ($dip === '' || filter_var($dip, FILTER_VALIDATE_IP) === false) {
+            respondWithError($config, 503, 'Задайте upstream_direct_ip в config.php', [
+                'hint' => 'Аналог Cloudflare: исходящее соединение должно идти на IP вашего сервера (origin), а не через DNS к Cloudflare. Укажите IPv4/IPv6 origin; иначе curl резолвит имя → CF → неверный vhost или заглушка.',
+            ]);
+        }
+    }
+
     $incomingHost = getIncomingHost();
     $upstreamHost = resolveUpstreamHost($incomingHost, $config);
 
@@ -244,6 +253,7 @@ function executeUpstreamCurl(
     $curlOpts = [
         CURLOPT_CUSTOMREQUEST => $_SERVER['REQUEST_METHOD'] ?? 'GET',
         CURLOPT_HTTPHEADER => $requestHeaders,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HEADER => false,
         CURLOPT_FOLLOWLOCATION => false,
@@ -376,11 +386,11 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
 
 function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string $clientIp, array $config): array
 {
-    $headers = [];
     $forwardedFor = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
     $forwardedFor = trim($forwardedFor);
     $forwardedFor = $forwardedFor !== '' ? $forwardedFor . ', ' . $clientIp : $clientIp;
 
+    $fromClient = [];
     foreach (getallheadersSafe() as $name => $value) {
         $lowerName = strtolower($name);
 
@@ -408,25 +418,44 @@ function buildUpstreamHeaders(string $incomingHost, string $upstreamHost, string
             $value = rewritePublicUrlsToUpstream($value, $config);
         }
 
-        $headers[] = $name . ': ' . $value;
+        $fromClient[] = $name . ': ' . $value;
     }
 
     $hostHeader = $config['preserve_original_host_header'] ? $incomingHost : $upstreamHost;
-    $headers[] = 'Host: ' . $hostHeader;
 
-    // Origin не знает won-onl.ru — только *.won.onl. Все эти поля = upstreamHost.
-    $headers[] = 'X-Forwarded-Host: ' . $hostHeader;
-    $headers[] = 'X-Forwarded-Proto: https';
-    $headers[] = 'X-Forwarded-For: ' . $forwardedFor;
-    $headers[] = 'X-Real-IP: ' . $clientIp;
-    $headers[] = 'Forwarded: for="' . $clientIp . '";host="' . $hostHeader . '";proto=https';
+    // Минимум как у прямого HTTPS к ru.won.onl: только Host (и SNI из URL). Без X-Forwarded-Host/Forwarded —
+    // иначе LiteSpeed/FastPanel иногда выбирают vhost не по Host и отдают заглушку.
+    $core = [
+        'Host: ' . $hostHeader,
+        'X-Forwarded-For: ' . $forwardedFor,
+        'X-Real-IP: ' . $clientIp,
+        'X-Forwarded-Proto: https',
+    ];
 
-    // Опционально: пробросить won-onl.ru на origin (обычно не нужно — ломает модель «только won.onl»).
-    if (!empty($config['send_public_host_header']) && $incomingHost !== $upstreamHost) {
-        $headers[] = 'X-Forwarded-Public-Host: ' . $incomingHost;
+    if (($config['mimic_cloudflare_to_origin'] ?? true)) {
+        // Как у Cloudflare к origin: реальный IP посетителя и схема (часть бэкендов ожидают именно CF-*).
+        array_splice($core, 1, 0, [
+            'CF-Connecting-IP: ' . $clientIp,
+            'CF-Visitor: {"scheme":"https"}',
+        ]);
+        $cc = isset($config['mimic_cf_ip_country']) ? trim((string) $config['mimic_cf_ip_country']) : '';
+        if ($cc !== '' && strlen($cc) === 2) {
+            array_splice($core, 3, 0, ['CF-IPCountry: ' . strtoupper($cc)]);
+        }
     }
 
-    return $headers;
+    if (!empty($config['upstream_extra_forward_headers'])) {
+        array_splice($core, 1, 0, [
+            'X-Forwarded-Host: ' . $hostHeader,
+            'Forwarded: for="' . $clientIp . '";host="' . $hostHeader . '";proto=https',
+        ]);
+    }
+
+    if (!empty($config['send_public_host_header']) && $incomingHost !== $upstreamHost) {
+        $core[] = 'X-Forwarded-Public-Host: ' . $incomingHost;
+    }
+
+    return array_merge($core, $fromClient);
 }
 
 function getallheadersSafe(): array

@@ -5,7 +5,8 @@ declare(strict_types=1);
 /*
  * Размещение: прокси (этот код) — на РФ-хостинге, домен won-onl.ru.
  * Целевая игра won.onl — на другом сервере; origin не знает про won-onl.ru. В запросе к
- * origin должны быть только имена *.won.onl (Host, SNI, URL, X-Forwarded-Host, Referer…).
+ * origin: TCP на upstream_direct_ip (минуя DNS Cloudflare), в TLS/HTTP — только имя *.won.onl
+ * (URL, SNI, Host). Без «лишних» заголовков, из‑за которых панель путает vhost.
  *
  * Cloudflare → origin (IP задаётся только upstream_direct_ip в вашей локальной копии):
  * - SSL «Flexible»: CF ходит на origin по HTTP:80 — прямой HTTPS к :443 часто даёт самоподпись;
@@ -20,12 +21,24 @@ return [
     // The upstream zone that hosts the real game (Host / SNI / переписывание ссылок).
     'upstream_base_domain' => 'won.onl',
 
-    // Прямой IP origin-сервера (обход Cloudflare/DNS). Соединение идёт на этот адрес,
-    // при этом curl использует имя upstreamHost в URL и SNI — как будто запрос к *.won.onl.
-    // Прямой IP origin (без Cloudflare). Не коммить реальный адрес в публичный репозиторий.
-    // Оставьте null — тогда будет обычный DNS (часто через CF). Из РФ часто «пустая» страница
-    // без прямого IP: запрос к CF режется или ответ пустой — задайте IP origin локально.
+    // IP сервера игры (origin). DNS won.onl указывает на Cloudflare — curl по имени попал бы на CF.
+    // Здесь задаётся прямой IP + CURLOPT_RESOLVE: TCP на IP, SNI/Host = *.won.onl (как CF к origin).
     'upstream_direct_ip' => '5.45.116.77',
+
+    // Без валидного IP прокси не стартует (иначе резолв уйдёт в CF).
+    'require_upstream_direct_ip' => true,
+
+    // false: на origin только Host + IP клиента + X-Forwarded-Proto (как почти прямой браузер к *.won.onl).
+    // true: добавить X-Forwarded-Host и Forwarded (часть панелей из‑за них ломают выбор сайта).
+    'upstream_extra_forward_headers' => false,
+
+    // Добавить к запросу на origin заголовки в духе Cloudflare → origin (CF-Connecting-IP, CF-Visitor и т.д.).
+    // User-Agent / Sec-* / Accept-* по-прежнему берутся из браузера (getallheaders). Полностью «как CF»
+    // по TLS/JA3 невозможно из PHP+cURL — только по HTTP-заголовкам.
+    'mimic_cloudflare_to_origin' => true,
+
+    // Двухбуквенный код страны для CF-IPCountry (если пусто — заголовок не шлём).
+    'mimic_cf_ip_country' => '',
 
     // Порт upstream (443 для HTTPS, 80 для HTTP если включён upstream_use_http).
     'upstream_direct_port' => 443,

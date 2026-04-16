@@ -220,12 +220,51 @@ function getClientIp(): string
 }
 
 /**
+ * IP для TCP к origin: по умолчанию upstream_direct_ip; для поддоменов см. upstream_direct_ip_overrides.
+ */
+function resolveUpstreamDirectIp(string $upstreamHost, array $config): string
+{
+    $default = trim((string) ($config['upstream_direct_ip'] ?? ''));
+    $overrides = $config['upstream_direct_ip_overrides'] ?? [];
+    if (!is_array($overrides) || $overrides === []) {
+        return $default;
+    }
+
+    $upstreamHost = strtolower($upstreamHost);
+    $base = strtolower((string) ($config['upstream_base_domain'] ?? ''));
+    if ($base === '') {
+        return $default;
+    }
+
+    $suffix = '.' . $base;
+    if (!str_ends_with($upstreamHost, $suffix)) {
+        return $default;
+    }
+
+    $label = substr($upstreamHost, 0, -strlen($suffix));
+    if ($label === '' || !preg_match('/^[a-z0-9.-]+$/', $label)) {
+        return $default;
+    }
+
+    if (!array_key_exists($label, $overrides)) {
+        return $default;
+    }
+
+    $ip = trim((string) $overrides[$label]);
+    if ($ip === '' || filter_var($ip, FILTER_VALIDATE_IP) === false) {
+        return $default;
+    }
+
+    return $ip;
+}
+
+/**
  * Подмена адреса для libcurl: TCP к IP, имя хоста в URL/SNI/Host — upstreamHost (*.won.onl).
  * Формат: "host:port:ip" для CURLOPT_RESOLVE.
  */
 function buildCurlResolve(string $upstreamHost, array $config): ?string
 {
-    $ip = trim((string) ($config['upstream_direct_ip'] ?? ''));
+    $ip = resolveUpstreamDirectIp($upstreamHost, $config);
     if ($ip === '' || filter_var($ip, FILTER_VALIDATE_IP) === false) {
         return null;
     }
@@ -330,6 +369,7 @@ function executeUpstreamCurl(
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HEADER => false,
         CURLOPT_FOLLOWLOCATION => false,
+        // Пустая строка = принять gzip/deflate и распаковать в теле; в emitResponse не пересылаем Content-Encoding клиенту.
         CURLOPT_ENCODING => '',
         CURLOPT_CONNECTTIMEOUT => $config['timeout'],
         CURLOPT_TIMEOUT => $config['timeout'],
@@ -817,8 +857,11 @@ function emitResponse(array $response, string $incomingHost, string $upstreamHos
         [$name] = array_pad(explode(':', $headerLine, 2), 2, null);
         $lowerName = strtolower(trim((string) $name));
 
+        // cURL с CURLOPT_ENCODING распаковывает gzip/deflate — тело уже без сжатия.
+        // Не пересылаем Content-Encoding (и длину из origin), иначе браузер «распакует» ещё раз → пустой/чёрный экран.
         if (in_array($lowerName, [
             'content-length',
+            'content-encoding',
             'transfer-encoding',
             'connection',
             'keep-alive',
@@ -914,53 +957,83 @@ function rewriteLocationHeader(string $headerLine, string $incomingHost, string 
 
 function shouldRewriteBody(string $contentType): bool
 {
-    $contentType = strtolower($contentType);
+    $ct = strtolower($contentType);
+    foreach ([
+        'text/html',
+        'text/xml',
+        'text/css',
+        'text/plain',
+        'text/javascript',
+        'application/json',
+        'application/xml',
+        'application/javascript',
+        'application/xhtml+xml',
+        'image/svg+xml',
+    ] as $needle) {
+        if (str_contains($ct, $needle)) {
+            return true;
+        }
+    }
 
-    return str_contains($contentType, 'text/html')
-        || str_contains($contentType, 'application/json')
-        || str_contains($contentType, 'application/javascript')
-        || str_contains($contentType, 'text/javascript')
-        || str_contains($contentType, 'text/css')
-        || str_contains($contentType, 'text/plain');
+    if (str_contains($ct, '+json') || str_contains($ct, '+xml')) {
+        return true;
+    }
+
+    return false;
 }
 
+/**
+ * Заменить в тексте все вхождения *.won.onl на эквивалент зеркала (won-onl.ru и поддомены).
+ * Схемы: https/http/ws/wss, protocol-relative //, «голый» hostname (JSON, JS-строки).
+ */
 function rewriteBody(string $body, string $incomingHost, string $upstreamHost, array $config): string
 {
-    $upstreamBase = $config['upstream_base_domain'];
+    $upstreamBase = strtolower($config['upstream_base_domain']);
+    $ubq = preg_quote($upstreamBase, '/');
 
-    $subdomain = '';
-    $suffix = '.' . $upstreamBase;
-    if (str_ends_with($upstreamHost, $suffix)) {
-        $subdomain = substr($upstreamHost, 0, -strlen($suffix));
-    }
+    $toPublic = static function (string $labelsWithOptionalDot) use ($upstreamBase, $config): string {
+        $labelsWithOptionalDot = strtolower(rtrim($labelsWithOptionalDot, '.'));
+        $hostOnOrigin = $labelsWithOptionalDot === ''
+            ? $upstreamBase
+            : $labelsWithOptionalDot . '.' . $upstreamBase;
 
-    if ($subdomain !== '') {
-        $body = str_replace(
-            [
-                'https://' . $upstreamHost,
-                '//' . $upstreamHost,
-            ],
-            [
-                'https://' . $incomingHost,
-                '//' . $incomingHost,
-            ],
-            $body
-        );
-    }
+        return publicHostForUpstreamHostname($hostOnOrigin, $config);
+    };
 
-    return preg_replace_callback(
-        '/https:\/\/([a-z0-9.-]+\.)?' . preg_quote($upstreamBase, '/') . '/i',
-        static function (array $matches) use ($config): string {
-            $sub = $matches[1] ?? '';
-            $hostOnOrigin = $sub === ''
-                ? $config['upstream_base_domain']
-                : rtrim($sub, '.') . '.' . $config['upstream_base_domain'];
-            $public = publicHostForUpstreamHostname($hostOnOrigin, $config);
+    // https:// http:// wss:// ws:// + опциональный порт
+    $body = preg_replace_callback(
+        '/\b((?:https?|wss?):\/\/)([a-z0-9.-]+\.)?' . $ubq . '(?::([0-9]+))?/iu',
+        static function (array $m) use ($toPublic): string {
+            $public = $toPublic($m[2] ?? '');
+            $port = isset($m[3]) && $m[3] !== '' ? ':' . $m[3] : '';
 
-            return 'https://' . $public;
+            return $m[1] . $public . $port;
         },
         $body
     ) ?? $body;
+
+    // //host.won.onl — без схемы (не трогаем второй // в https:// — перед ним стоит :)
+    $body = preg_replace_callback(
+        '/(?<!:)(\/\/)([a-z0-9.-]+\.)?' . $ubq . '(?::([0-9]+))?/iu',
+        static function (array $m) use ($toPublic): string {
+            $public = $toPublic($m[2] ?? '');
+            $port = isset($m[3]) && $m[3] !== '' ? ':' . $m[3] : '';
+
+            return $m[1] . $public . $port;
+        },
+        $body
+    ) ?? $body;
+
+    // Оставшиеся «голые» host.won.onl (JSON, JS, конфиги) — не трогаем won.onl.evil
+    $body = preg_replace_callback(
+        '/(?<![a-zA-Z0-9])((?:[a-z0-9.-]+\.)?' . $ubq . ')(?![a-zA-Z0-9.])/iu',
+        static function (array $m) use ($config): string {
+            return publicHostForUpstreamHostname(strtolower($m[1]), $config);
+        },
+        $body
+    ) ?? $body;
+
+    return $body;
 }
 
 function isWebSocketHandshake(): bool

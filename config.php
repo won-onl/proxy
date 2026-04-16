@@ -25,6 +25,11 @@ return [
     // Здесь задаётся прямой IP + CURLOPT_RESOLVE: TCP на IP, SNI/Host = *.won.onl (как CF к origin).
     'upstream_direct_ip' => '5.45.116.77',
 
+    // Другой IP для отдельных поддоменов на origin (ключ — метка до .won.onl, например mapgen → mapgen.won.onl).
+    'upstream_direct_ip_overrides' => [
+        'mapgen' => '159.253.21.239',
+    ],
+
     // Без валидного IP прокси не стартует (иначе резолв уйдёт в CF).
     'require_upstream_direct_ip' => true,
 

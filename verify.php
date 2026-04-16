@@ -59,6 +59,7 @@ if ($upstreamHost === null) {
 
 echo 'mapped_upstream_host=' . $upstreamHost . "\n";
 echo 'upstream_direct_ip=' . ($config['upstream_direct_ip'] ?? '') . "\n";
+echo 'upstream_direct_ip_effective=' . resolveUpstreamDirectIp($upstreamHost, $config) . "\n";
 echo 'https_ports_priority=' . implode(', ', array_map('strval', upstreamHttpsPortPriority($config))) . "\n";
 echo 'retry_http_port=' . (int) ($config['retry_http_port'] ?? 80) . "\n";
 echo 'probe_path=' . $path . "\n\n";

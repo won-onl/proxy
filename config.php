@@ -28,8 +28,10 @@ return [
     // Set to null to reject such requests with 400.
     'fallback_upstream_host' => null,
 
-    // TLS verification for upstream HTTPS.
-    'verify_upstream_tls' => true,
+    // Проверка TLS к upstream. При подключении по upstream_direct_ip origin часто отдаёт
+    // самоподписанный или «не тот» сертификат (обход Cloudflare) — тогда оставьте false.
+    // Поставьте true, если на IP висит валидный сертификат на нужные имена *.won.onl.
+    'verify_upstream_tls' => false,
 
     // Upstream request timeout in seconds.
     'timeout' => 60,

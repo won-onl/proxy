@@ -196,13 +196,14 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
     curl_close($ch);
 
     if ($body === false) {
-        $httpCode = $curlErrno === CURLE_OPERATION_TIMEDOUT ? 504 : 502;
+        // 28 = CURLE_OPERATION_TIMEDOUT (число — на части хостингов константа не объявлена)
+        $httpCode = $curlErrno === 28 ? 504 : 502;
         respondWithError($config, $httpCode, 'Нет ответа от upstream (ошибка cURL)', [
             'upstream_url' => $url,
             'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
             'curl_errno' => $curlErrno,
             'curl_error' => $curlError,
-            'hint' => curlErrorHint($curlErrno, $config),
+            'hint' => curlErrorHint($curlErrno, $config, $curlError),
         ]);
     }
 
@@ -212,7 +213,7 @@ function proxyRequest(string $url, string $incomingHost, string $upstreamHost, s
             'curl_resolve' => $resolveLine ?? '(DNS как обычно)',
             'curl_errno' => $curlErrno,
             'curl_error' => $curlError ?: '(пусто)',
-            'hint' => curlErrorHint($curlErrno, $config),
+            'hint' => curlErrorHint($curlErrno, $config, $curlError),
         ]);
     }
 
@@ -480,22 +481,35 @@ function respondWithError(array $config, int $status, string $message, array $de
     exit;
 }
 
-function curlErrorHint(int $curlErrno, array $config): string
+function curlErrorHint(int $curlErrno, array $config, string $curlError = ''): string
 {
-    if ($curlErrno === CURLE_SSL_CONNECT_ERROR || $curlErrno === CURLE_PEER_FAILED_VERIFICATION) {
-        return 'Проблема TLS/сертификата upstream. Для проверки можно временно выставить verify_upstream_tls => false в config.php (только на время отладки).';
+    // Коды libcurl числами: на части хостингов константы CURLE_* в PHP не определены.
+    // 6 resolve, 7 connect, 28 timeout, 35 SSL connect, 51/58/60/77 — типичные SSL/cert.
+    $sslRelated = [35, 51, 58, 60, 77];
+    if (in_array($curlErrno, $sslRelated, true)) {
+        $verifyOn = !empty($config['verify_upstream_tls']);
+
+        if (!$verifyOn) {
+            return 'Проверка TLS к upstream отключена, но ошибка SSL всё равно есть — проверьте upstream_direct_port, upstream_use_http и что на IP слушается ожидаемый протокол.';
+        }
+
+        if (!empty($config['upstream_direct_ip'])) {
+            return 'Прямое подключение к IP: на origin часто самоподписанный или «чужой» сертификат. В config.php задайте verify_upstream_tls => false или поставьте на origin валидный TLS для имён *.won.onl.';
+        }
+
+        return 'Проблема TLS/сертификата upstream. Для отладки: verify_upstream_tls => false в config.php; в проде — валидный сертификат на стороне origin.';
     }
-    if ($curlErrno === CURLE_COULDNT_RESOLVE_HOST) {
+    if ($curlErrno === 6) {
         if (!empty($config['upstream_direct_ip'])) {
             return 'Ошибка резолва при CURLOPT_RESOLVE — проверьте upstream_direct_ip и имя хоста.';
         }
 
         return 'DNS не резолвит upstream с этого сервера — проверьте сетевой доступ хостинга к won.onl.';
     }
-    if ($curlErrno === CURLE_OPERATION_TIMEDOUT) {
+    if ($curlErrno === 28) {
         return 'Таймаут — upstream не ответил за ' . (int) ($config['timeout'] ?? 60) . ' с.';
     }
-    if ($curlErrno === CURLE_COULDNT_CONNECT) {
+    if ($curlErrno === 7) {
         return 'Не удалось установить TCP-соединение с upstream (файрвол, блокировка, неверный порт).';
     }
 
